@@ -9,7 +9,9 @@
 
 ## Bottom line
 
-**No unprivileged critical.** The parts that would carry one — the share/rebase ledger, payer binding, and collateral conservation — are sound, and I have the invariant runs to back that. The strongest unprivileged finding is **High**: `depositEtherToMint`/`depositStETHToMint` let anyone open debt against a third party's collateral, dragging an unwilling account down to the 160% liquidation floor. It is damaging but not critical, because the victim receives the minted eUSD and can unwind the position themselves.
+**There is an unprivileged critical, but only as a chain.** No single function on this contract yields one — the share/rebase ledger, payer binding and collateral conservation are individually sound, and the invariant runs back that. The critical comes from composing finding **#1** (anyone can open debt against a third party's collateral) with finding **#2** (`liquidation()` enforces no borrower rate floor), scaled by **#4** (the per-account mint cap is bypassable).
+
+Composed, they give a repeatable, positive-EV theft from accounts that never opted into anything: for a **1 ETH** outlay an attacker forces an idle depositor to the 160% liquidation floor, waits for an ordinary 6.25% ETH move, and liquidates them. Measured end to end against a no-attack control on the same price path: **victim loses $44,973, attacker gains $46,843 — a 23.4x return on the outlay**, against a victim who had *zero* liquidation exposure before the attack manufactured it. See *Chained severity* below.
 
 ## Trust model used
 
@@ -21,7 +23,7 @@
 
 ## Findings
 
-### 1. Anyone can force debt onto a third party's collateral — High
+### 1. Anyone can force debt onto a third party's collateral — High standalone, **Critical chained**
 
 `depositEtherToMint` (`Lybra.sol:190`) and `depositStETHToMint` (`Lybra.sol:221`) take a caller-chosen `onBehalfOf` and call `_mintEUSD(onBehalfOf, onBehalfOf, mintAmount)` (`Lybra.sol:205`, `Lybra.sol:233`). The debt lands on `onBehalfOf`, and the only guard is `_checkHealth(onBehalfOf)` (`Lybra.sol:532`), which merely requires the resulting rate to clear `safeCollateralRate` (160%). It never asks whether `onBehalfOf` consented.
 
@@ -43,7 +45,7 @@ liquidation of 50% of collateral: victim loses 5.05 ETH to the 10% penalty
 
 **Fix.** Credit the debt to `msg.sender`, or require that `onBehalfOf == msg.sender` whenever `mintAmount > 0`. Deposits on behalf of others are safe; *minting* on behalf of others is not.
 
-### 2. `liquidation()` enforces no rate floor and no overall-rate guard — Medium/High
+### 2. `liquidation()` enforces no rate floor and no overall-rate guard — Medium/High standalone, **critical path for the chain**
 
 `liquidation()` (`Lybra.sol:302`) requires only that the borrower is under 150% (`Lybra.sol:311`) and that at most 50% of collateral is taken (`Lybra.sol:316`). Its own NatSpec at `Lybra.sol:294` states the precondition *"When overallCollateralRate is above 150%"* — **that is never checked**. `superLiquidation` does guard its regime (`Lybra.sol:365`); `liquidation` guards nothing.
 
@@ -73,6 +75,51 @@ The cap at `Lybra.sol:274` lives only in `mint()`. The deposit paths reach `_min
 ### 5. stETH dust can temporarily brick `excessIncomeDistribution` — Low
 
 `Lybra.sol:430` computes `lido.balanceOf(address(this)) - totalDepositedEther`. stETH transfers can deliver 1–2 wei less than requested while `depositedEther` is credited the full amount (`Lybra.sol:230`), so the balance can sit marginally below the ledger and this subtraction underflows, reverting the whole function. The fuzzer hit this at a 1-wei deficit. Self-heals as staking yield accrues.
+
+---
+
+## Chained severity
+
+I tested four chains (`audit/poc/test_chains.js`, `audit/poc/test_chain_pnl.js`). One lands, one is a minor amplifier, two do not compose.
+
+### Chain A — #1 + #2 (+ #4): **Critical**
+
+Standalone, #1 looks survivable: the victim receives the eUSD and the attacker is out 1 ETH. That reading is wrong once #2 is in the picture. #1 does not merely create leverage — it **manufactures liquidatable volume out of collateral the attacker does not own**, and #2 is the mechanism that monetises it at a fixed 10% bonus with no rate floor.
+
+The attacker pre-positions and waits. Forced debt persists until the victim notices and calls `burn`, and an account that only ever deposited collateral has no reason to be watching and receives no notification. Any 6.25% dip then springs the trap.
+
+Measured, against a control run on the identical price path:
+
+```
+victim: 500 ETH collateral, zero debt, no approvals, no liquidation exposure
+attacker: depositEtherToMint(victim, 625000e18) with 1 ETH   -> victim pinned at 160.00%
+ETH -6.5% (routine)                                          -> victim at 149.60%, liquidatable
+liquidation of 50% of collateral
+  control net worth @ $1870 : $935,000
+  attacked net worth @ $1870: $890,026
+  VICTIM LOSS               : $44,973
+  ATTACKER GAIN             : $46,843   on a $2,000 outlay = 23.4x
+```
+
+Scaling is limited only by how much idle collateral is deposited; #4 removes the per-account cap that would otherwise throttle it. Across six idle depositors the attacker turned $12,000 into $281,061, and compressed the protocol-wide collateral rate from 2800% to 207.70% in the process.
+
+**This is the unprivileged critical.** Direct theft of user funds, repeatable, positive-EV, against non-consenting third parties. The only precondition the attacker does not control is a 6.25% move — which is routine, not exotic.
+
+### Chain B — #3 removes the capital requirement: minor amplifier
+
+Chain A as written needs the attacker to hold enough eUSD to fund the liquidation. #3 removes that: because `allowance(provider, address(this))` is checked but never decremented, an attacker with **zero capital** can name any address that has ever approved Lybra as the funder. Verified: an attacker holding 0 eUSD and 0 stETH extracted 0.5 stETH ($935) by drafting a third party's standing allowance, which was unchanged afterwards and remains reusable forever. This only yields the keeper cut (~0.9%) rather than the 10% bonus, so it lowers the barrier to entry rather than raising the take.
+
+### Chain C — cascading liquidation to unlock `superLiquidation`: **does not compose**
+
+I expected mass liquidation to drag the overall rate under the 150% `superLiquidation` gate, since each call removes 1.1x collateral per 1x debt. It does not. That ratio only *lowers* the system-wide rate when the overall rate is already below 110%; above it, liquidation **raises** it. Measured: after liquidating all six victims the overall rate went *up*, 194.20% -> 994.80%, and the `superLiquidation` gate stayed shut. `superLiquidation` remains reachable only in a genuine systemic crisis, and it is backing-neutral in every branch anyway.
+
+### Chain D — fee redirection at scale: real but hard-capped at ~27%
+
+Forced debt inflates `totalEUSDCirculation` without adding collateral, so it inflates `_newFee()` and redirects yield from eUSD holders to LBR stakers. The terminal "eUSD holders get zero rebase forever" state is **not reachable**: minting requires 160% backing, so the aggregate satisfies `V/T >= 1.6`, and the diverted fraction is bounded by `1.5% / (1.6 x stETH yield)` ~ 27% at a 3.5% staking yield. An attacker running Chain A at scale moves that fraction from ~2% toward its ~27% ceiling — a real degradation of eUSD's core value proposition, but not a shutoff.
+
+### Chain E — sustained DoS via #5: **does not compose**
+
+The stETH dust deficit cannot be maintained. Inducing it costs roughly a full ether of locked capital per 2 wei of shortfall, against a daily Lido rebase measured in whole ETH. It heals faster than any attacker can widen it.
 
 ---
 

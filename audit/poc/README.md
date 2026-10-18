@@ -10,6 +10,8 @@ npm install
 node poc_forced_debt.js     # Finding 1: forced debt on a third party's collateral
 node test_liq.js            # Finding 2: liquidation() with no rate floor -> bad debt
 node test_mintcap.js        # Finding 4: the 10% per-account mint cap is bypassable
+node test_chains.js         # chain analysis: which findings compose, which don't
+node test_chain_pnl.js      # CRITICAL: measured victim loss vs a no-attack control
 node fuzz.js [seed]         # 400-step random-action invariant fuzz
 node test_sharemath.js      # share/rebase ratio edge cases (sound)
 node test_excess.js         # excessIncomeDistribution is not extractable (sound)
