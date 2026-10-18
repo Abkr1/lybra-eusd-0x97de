@@ -1,0 +1,12 @@
+{
+  "name": "lybra-eusd-audit-poc",
+  "private": true,
+  "description": "Local-EVM proof-of-concept harness for the Lybra eUSD security review",
+  "dependencies": {
+    "@ethereumjs/block": "5.3.0",
+    "@ethereumjs/common": "4.3.0",
+    "@ethereumjs/util": "9.0.3",
+    "@ethereumjs/vm": "7.2.0",
+    "solc": "0.8.17"
+  }
+}
